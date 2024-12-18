@@ -24,15 +24,16 @@ from . import types
 logger = logging.getLogger(__name__)
 
 
-@pytest.mark.asyncio
 @pytest.mark.abort_on_fail
-async def test_active(app: Application):
+def test_active(app: Juju):
     """Check that the charm is active.
     Assume that the charm has already been built and is running.
     """
     # Application actually does have units
     # Mypy has difficulty with ActiveStatus
-    assert app.units[0].workload_status == ActiveStatus.name  # type: ignore
+    juju = app
+    status = juju.status()
+    assert status.apps["discourse-k8s"].units[0].is_active
 
 
 @pytest.mark.asyncio

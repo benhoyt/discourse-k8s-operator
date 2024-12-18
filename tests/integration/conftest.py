@@ -131,13 +131,13 @@ async def discourse_address_fixture(model: Model, app: Application):
     return f"http://{unit_ip}:3000"
 
 
-@pytest_asyncio.fixture(scope="module", name="app")
-async def app_fixture(
+@pytest.fixture(scope="module", name="app")
+def app_fixture(
     ops_test: OpsTest,
     app_name: str,
     app_config: Dict[str, str],
     pytestconfig: Config,
-    model: Model,
+    juju: jubilant.Juju,
 ):
     # pylint: disable=too-many-locals
     """Discourse charm used for integration testing.
@@ -148,64 +148,61 @@ async def app_fixture(
         yield model.applications[app_name]
         return
 
-    postgres_app = await model.deploy(
+    juju.deploy(
         "postgresql-k8s",
         channel="14/stable",
-        series="jammy",
+        base="22.04",
         revision=300,
         trust=True,
         config={"profile": "testing"},
     )
-    async with ops_test.fast_forward():
-        await model.wait_for_idle(apps=[postgres_app.name], status="active")
+    with jubilant.update_status_interval(juju, "10s"):
+        juju.wait(lambda status: status.apps["postgresql-k8s"].is_active)
 
-    redis_app = await model.deploy("redis-k8s", series="jammy", channel="latest/edge")
-    await model.wait_for_idle(apps=[redis_app.name], status="active")
+    juju.deploy("redis-k8s", base="22.04", channel="latest/edge")
+    juju.wait(lambda status: status.apps["redis-k8s"].is_active)
 
-    await model.deploy("nginx-ingress-integrator", series="focal", trust=True)
+    juju.deploy("nginx-ingress-integrator", base="20.04", trust=True)
 
     resources = {
         "discourse-image": pytestconfig.getoption("--discourse-image"),
     }
 
     if charm := pytestconfig.getoption("--charm-file"):
-        application = await model.deploy(
+        juju.deploy(
             f"./{charm}",
+            app_name,
             resources=resources,
-            application_name=app_name,
             config=app_config,
-            series="focal",
+            base="20.04",
         )
     else:
-        charm = await ops_test.build_charm(".")
-        application = await model.deploy(
+        subprocess.run(["charmcraft", "pack"], check=True)
+        juju.deploy(
             charm,
+            app_name,
             resources=resources,
-            application_name=app_name,
             config=app_config,
-            series="focal",
+            base="20.04",
         )
 
-    await model.wait_for_idle(apps=[application.name], status="waiting")
+    juju.wait(lambda status: status.apps[app_name].is_waiting)
 
     # configure postgres
-    await postgres_app.set_config(
-        {
-            "plugin_hstore_enable": "true",
-            "plugin_pg_trgm_enable": "true",
-        }
-    )
-    await model.wait_for_idle(apps=[postgres_app.name], status="active")
+    juju.set_config({
+        "plugin_hstore_enable": "true",
+        "plugin_pg_trgm_enable": "true",
+    })
+    juju.wait(lambda status: status.apps["postgresql-k8s"].is_active)
 
     # Add required relations
-    unit = model.applications[app_name].units[0]
-    assert unit.workload_status == WaitingStatus.name  # type: ignore
-    await asyncio.gather(
-        model.add_relation(app_name, "postgresql-k8s:database"),
-        model.add_relation(app_name, "redis-k8s"),
-        model.add_relation(app_name, "nginx-ingress-integrator"),
-    )
-    await model.wait_for_idle(status="active")
+    status = juju.status()
+    unit = status.apps[app_name].units[0]
+    assert unit.is_waiting
+    juju.integrate(app_name, "postgresql-k8s:database")
+    juju.integrate(app_name, "redis-k8s")
+    juju.integrate(app_name, "nginx-ingress-integrator")
+    juju.wait(jubilant.all_active)
 
     # Enable plugins calling rake site_settings:import in one of the units.
     inline_yaml = "\n".join(f"{plugin}_enabled: true" for plugin in ENABLED_PLUGINS)
@@ -219,12 +216,11 @@ async def app_fixture(
         f"'set -euo pipefail; echo \"{inline_yaml}\" | {pebble_exec} -- {discourse_rake_command}'"
     )
     logger.info("Enable plugins command: %s", full_command)
-    action = await unit.run(full_command)
-    await action.wait()
-    logger.info(action.results)
-    assert action.results["return-code"] == 0, "Enable plugins failed"
+    result = juju.exec(unit.name, full_command)  # TODO: to be designed/implemented
+    logger.info(result)
+    assert result.returncode == 0, "Enable plugins failed"
 
-    yield application
+    yield juju
 
 
 @pytest_asyncio.fixture(scope="module")
